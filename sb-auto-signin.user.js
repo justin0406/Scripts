@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         烧饼论坛 自动签到 (CAP 版)
 // @namespace    https://sb.sb/
-// @version      1.0
+// @version      1.1
 // @description  修复 sb.sb 自动签到：绕过 cap 验证码，注入 cap-widget 自动解出 cap-token 后提交签到。可独立使用，替代「烧饼论坛 Pro」内置的自动签到。
 // @match        *://sb.sb/*
+// @updateURL    https://raw.githubusercontent.com/justin0406/Scripts/main/sb-auto-signin.user.js
+// @downloadURL  https://raw.githubusercontent.com/justin0406/Scripts/main/sb-auto-signin.user.js
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
