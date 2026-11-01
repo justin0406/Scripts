@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         烧饼论坛 自动签到 (CAP 版)
 // @namespace    https://sb.sb/
-// @version      1.1
-// @description  修复 sb.sb 自动签到：绕过 cap 验证码，注入 cap-widget 自动解出 cap-token 后提交签到。可独立使用，替代「烧饼论坛 Pro」内置的自动签到。
+// @version      2.0.0
+// @description  在 Safari 打开烧饼论坛时自动完成 /checkin/ 每日签到（cap 工作量证明由站点自身组件完成）。
 // @match        *://sb.sb/*
 // @updateURL    https://raw.githubusercontent.com/justin0406/Scripts/main/sb-auto-signin.user.js
 // @downloadURL  https://raw.githubusercontent.com/justin0406/Scripts/main/sb-auto-signin.user.js
@@ -13,31 +13,65 @@
 // @license      GPL-3.0
 // ==/UserScript==
 
+/*
+ * 版本说明（2.0.0）
+ * 站点早已不是「/signin/ + 原生表单 + cap-token 手填」的旧结构：
+ *   1. /signin/ 会 302 到 /checkin/，真实签到页是 /checkin/
+ *   2. 签到表单是 .signin-form，验证码容器是 [data-signin-cap] 里的 <cap-widget>
+ *   3. cap token 通过 <cap-widget> 的 "solve" 事件 detail.token 交付，
+ *      站点自己的监听器会写入 input[name="cap-token"] 并 requestSubmit()
+ *   4. cap 的 JS 只在登录后的签到页加载，其它页面没有这个自定义元素
+ * 所以本脚本不再自己解题、不再拼表单字段，只做：
+ *   判断状态 → 触发站点自己的提交流程 → 兜底戳一下 widget → 回查确认
+ */
+
 (function () {
     'use strict';
 
-    /* ============ 配置 ============ */
-    const CAP_ENDPOINT = 'https://capjs.net/415786673b/'; // 站点使用的 cap 服务端
-    const SIGNIN_URL = '/signin/';
-    const KEY_LAST = 'sbCapLastSignin';
-    const KEY_FORCE = 'sbCapForceSignin';
     const LOG = '[SB-CAP]';
+    const CHECKIN_URL = '/checkin/';
+    const KEY_LAST = 'sbCapLastSignin';
+    const KEY_NAV = 'sbCapAutoNav';
+    const VERIFY_TRIES = 14;
+    const VERIFY_GAP = 1500;
 
-    const today = () => new Date().toLocaleDateString('zh-CN');
+    let busy = false;
+    let watched = false;
+
+    /* ---------- 基础工具 ---------- */
     const log = (...a) => console.log(LOG, ...a);
     const warn = (...a) => console.warn(LOG, ...a);
-
-    /* ============ 小工具 ============ */
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    async function waitFor(fn, timeout = 15000, step = 100) {
-        const end = Date.now() + timeout;
-        while (Date.now() < end) {
-            try { const v = fn(); if (v) return v; } catch (e) { /* ignore */ }
-            await sleep(step);
+    const todayKey = () => {
+        const d = new Date();
+        return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+    };
+
+    /* Stay / 其它管理器不一定提供 GM_*：全部包一层，失败退回 localStorage */
+    const store = {
+        get(key, fallback = '') {
+            try {
+                if (typeof GM_getValue === 'function') {
+                    const v = GM_getValue(key, fallback);
+                    return v === undefined || v === null ? fallback : v;
+                }
+            } catch (e) { /* fallthrough */ }
+            try { return localStorage.getItem(key) ?? fallback; } catch (e) { return fallback; }
+        },
+        set(key, value) {
+            try {
+                if (typeof GM_setValue === 'function') { GM_setValue(key, value); return; }
+            } catch (e) { /* fallthrough */ }
+            try { localStorage.setItem(key, value); } catch (e) { /* ignore */ }
         }
-        return null;
-    }
+    };
+
+    const session = {
+        get(key) { try { return sessionStorage.getItem(key); } catch (e) { return null; } },
+        set(key, value) { try { sessionStorage.setItem(key, value); } catch (e) { /* ignore */ } },
+        del(key) { try { sessionStorage.removeItem(key); } catch (e) { /* ignore */ } }
+    };
 
     function toast(msg, kind = 'info') {
         const colors = { info: '#333', success: '#1a7f37', warn: '#9a6700', error: '#b42318' };
@@ -52,228 +86,228 @@
             'font-family:-apple-system,BlinkMacSystemFont,sans-serif'
         ].join(';');
         document.body.appendChild(el);
-        setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 350); }, kind === 'error' ? 4200 : 2600);
+        setTimeout(() => {
+            el.style.opacity = '0';
+            setTimeout(() => el.remove(), 350);
+        }, kind === 'error' ? 4200 : 2600);
     }
 
-    function isLoggedIn() {
-        // 未登录时页面顶部/侧栏会有指向 /login/ 的入口
-        if (document.querySelector('a[href="/login/"], a[href^="/login/"]')) return false;
-        // 存在用户名元素或退出登录入口则视为已登录
-        if (document.querySelector('a[href="/logout/"], [data-username]')) return true;
-        return true; // 保守：交给后续接口判断
+    async function waitFor(fn, timeout = 8000, step = 150) {
+        const end = Date.now() + timeout;
+        while (Date.now() < end) {
+            try {
+                const v = fn();
+                if (v) return v;
+            } catch (e) { /* ignore */ }
+            await sleep(step);
+        }
+        return null;
     }
 
-    /* ============ 核心：解决 cap 验证码 ============ */
-    // 返回 { token } | { blocked } | null(超时)
-    async function solveCap() {
-        // 优先复用页面上已有的 widget（例如就在 /signin/ 页）
-        let widget = document.querySelector('cap-widget');
-        let injected = false;
-
-        if (!widget) {
-            widget = document.createElement('cap-widget');
-            widget.id = '__sb_cap_widget';
-            widget.setAttribute('data-cap-api-endpoint', CAP_ENDPOINT);
-            // 放到视口内但几乎不可见，避免某些环境对不可见元素不触发
-            widget.style.cssText = 'position:fixed;left:0;bottom:0;width:1px;height:1px;'
-                + 'opacity:0.01;pointer-events:none;z-index:-1';
-            document.body.appendChild(widget);
-            injected = true;
-        }
-
-        const sr = await waitFor(() => widget.shadowRoot, 5000);
-        if (!sr) { if (injected) widget.remove(); warn('widget 未渲染'); return null; }
-
-        // 已经解过就直接用
-        if (widget.token) {
-            if (injected) setTimeout(() => widget.remove(), 1200);
-            return { token: widget.token };
-        }
-
-        const trigger = sr.querySelector('.captcha-trigger');
-        if (!trigger) { if (injected) widget.remove(); warn('找不到验证触发元素'); return null; }
-
-        // 程序化点击（实测可直接通过，无需真实手势）
-        const press = (el) => {
-            const opt = { bubbles: true, cancelable: true, composed: true, pointerType: 'mouse', isPrimary: true };
-            try { el.dispatchEvent(new PointerEvent('pointerdown', opt)); } catch (e) {}
-            try { el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true })); } catch (e) {}
-            try { el.dispatchEvent(new PointerEvent('pointerup', opt)); } catch (e) {}
-            try { el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true })); } catch (e) {}
-            try { el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); } catch (e) {}
-            try { el.click(); } catch (e) {}
-        };
-        press(trigger);
-
-        const cap = sr.querySelector('.captcha');
-
-        // 等待 token 出现（widget 解完会写入 .token 属性，并回填隐藏域）
-        const token = await waitFor(() => {
-            if (widget.token) return widget.token;
-            const hidden = document.querySelector('input[name="cap-token"]');
-            if (hidden && hidden.value) return hidden.value;
-            return null;
-        }, 30000, 200);
-
-        if (!token) {
-            const state = cap && cap.getAttribute('data-state');
-            warn('未取得 token, state =', state);
-            if (injected) widget.remove();
-            return state === 'error' ? { blocked: true } : null;
-        }
-
-        if (injected) setTimeout(() => widget.remove(), 1200);
-        return { token };
+    /* ---------- 站点状态（以服务端返回为准） ---------- */
+    async function fetchText(url) {
+        const res = await fetch(url, { credentials: 'include', cache: 'no-store', redirect: 'follow' });
+        return await res.text();
     }
 
-    /* ============ 读取签到页状态 ============ */
-    async function fetchSigninDoc() {
-        const res = await fetch(SIGNIN_URL, { credentials: 'include', cache: 'no-store' });
-        if (!res.ok && !res.redirected) throw new Error('HTTP ' + res.status);
-        const html = await res.text();
+    function stripHtml(html) {
+        return html
+            .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+            .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/\s+/g, ' ');
+    }
+
+    async function serverState() {
+        const html = await fetchText(CHECKIN_URL);
+        const text = stripHtml(html);
         return {
-            doc: new DOMParser().parseFromString(html, 'text/html'),
-            finalUrl: res.url || SIGNIN_URL
+            signed: /今日已签到/.test(text),
+            loggedIn: /\/logout\//.test(html),
+            hasForm: /signin-form/.test(html) || /data-signin-cap/.test(html)
         };
     }
 
-    function parseSigninDoc(doc) {
-        const text = doc.body ? doc.body.textContent || '' : '';
-        const signedIn = /今日已签到|已经签到|已签到/.test(text);
-        const csrf = (doc.querySelector('input[name="_csrf"]') || {}).value || null;
-        // 找到真正的签到表单（排除搜索框）
-        const forms = [...doc.querySelectorAll('form')];
-        const form = forms.find((f) => (f.getAttribute('action') || '').includes('/signin/'))
-            || forms.find((f) => f.querySelector('input[name="cap-token"]'))
-            || null;
-        let fields = {};
-        if (form) {
-            [...form.querySelectorAll('input')].forEach((el) => {
-                if (!el.name || el.type === 'submit' || el.type === 'button') return;
-                if (el.name === 'cap-token') return; // 稍后填
-                fields[el.name] = el.value;
-            });
-        }
-        const btn = doc.querySelector('.signin-hero-action button, form button[type="submit"]');
-        const disabled = btn ? !!btn.disabled : false;
-        return { signedIn: signedIn || disabled, csrf, form, fields };
+    function findForm() {
+        const direct = document.querySelector('form.signin-form');
+        if (direct) return direct;
+        const capHost = document.querySelector('[data-signin-cap]');
+        if (capHost && capHost.closest('form')) return capHost.closest('form');
+        return [...document.querySelectorAll('form')].find((f) =>
+            /checkin|signin/i.test(f.getAttribute('action') || '')
+        ) || null;
     }
 
-    /* ============ 静默签到（不离开当前页） ============ */
-    async function silentSignin() {
-        const { doc } = await fetchSigninDoc();
-        const info = parseSigninDoc(doc);
-        if (info.signedIn) return { ok: true, already: true };
-        if (!info.csrf) throw new Error('缺少 CSRF');
-
-        const solved = await solveCap();
-        if (!solved || !solved.token) return { ok: false, reason: 'cap_failed' };
-
-        // 组装提交体：沿用页面上的隐藏字段，补上 cap-token
-        const body = new URLSearchParams(info.fields);
-        if (!body.has('_csrf')) body.set('_csrf', info.csrf);
-        body.set('cap-token', solved.token);
-
-        const res = await fetch(SIGNIN_URL, {
-            method: 'POST',
-            credentials: 'include',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'X-Requested-With': 'XMLHttpRequest'
-            },
-            body: body.toString()
+    /* ---------- cap widget：不自己解题，只把它推起来 ---------- */
+    function press(el) {
+        const opt = { bubbles: true, cancelable: true, composed: true, pointerType: 'mouse', isPrimary: true };
+        [['PointerEvent', 'pointerdown', opt], ['MouseEvent', 'mousedown', {}],
+         ['PointerEvent', 'pointerup', opt], ['MouseEvent', 'mouseup', {}],
+         ['MouseEvent', 'click', {}]].forEach(([Ctor, type, o]) => {
+            try { el.dispatchEvent(new window[Ctor](type, o)); } catch (e) { /* ignore */ }
         });
-        const html = await res.text();
-        const after = parseSigninDoc(new DOMParser().parseFromString(html, 'text/html'));
-        const ok = after.signedIn || res.redirected;
-        log('POST', res.status, 'ok =', ok);
-        return { ok, status: res.status, already: false };
+        try { el.click(); } catch (e) { /* ignore */ }
     }
 
-    /* ============ 回退方案：在 /signin/ 页面上原生提交 ============ */
-    async function pageSignin() {
-        const form = [...document.querySelectorAll('form')]
-            .find((f) => (f.getAttribute('action') || '').includes('/signin/'))
-            || [...document.querySelectorAll('form')].find((f) => f.querySelector('input[name="cap-token"]'));
-        if (!form) return { ok: false, reason: 'no_form' };
+    async function nudge(widget) {
+        try { widget.focus(); } catch (e) { /* ignore */ }
 
-        const solved = await solveCap();
-        if (!solved || !solved.token) return { ok: false, reason: 'cap_failed' };
-
-        // 确保隐藏域已填（widget 通常会自己填，这里兜底）
-        let hidden = form.querySelector('input[name="cap-token"]');
-        if (!hidden) {
-            hidden = document.createElement('input');
-            hidden.type = 'hidden';
-            hidden.name = 'cap-token';
-            form.appendChild(hidden);
+        for (let i = 0; i < 4; i += 1) {
+            if (widget.token) return widget.token;
+            const sr = widget.shadowRoot;
+            const trigger = sr && sr.querySelector('.captcha-trigger');
+            if (trigger) press(trigger);
+            await sleep(1500);
         }
-        hidden.value = solved.token;
-
-        // 交给浏览器原生提交：Origin/Referer/_csrf 全部天然正确
-        HTMLFormElement.prototype.submit.call(form);
-        return { ok: true, navigated: true };
+        return widget.token || null;
     }
 
-    /* ============ 主流程 ============ */
-    const KEY_TRIES = 'sbCapTries';
+    /* ---------- 回查确认 ---------- */
+    async function verifySigned() {
+        for (let i = 0; i < VERIFY_TRIES; i += 1) {
+            await sleep(VERIFY_GAP);
+            try {
+                const st = await serverState();
+                if (st.signed) return true;
+            } catch (e) { warn('回查失败', e); }
+        }
+        return false;
+    }
 
-    async function run(force = false) {
-        if (!force && GM_getValue(KEY_LAST, '') === today()) return;
-        if (!isLoggedIn()) { log('未登录，跳过'); return; }
+    function markDone() {
+        store.set(KEY_LAST, todayKey());
+        session.del(KEY_NAV);
+    }
 
-        const onSigninPage = /^\/signin\/?/.test(location.pathname);
-        const forceFlag = sessionStorage.getItem(KEY_FORCE) === '1';
-        let tries = Number(sessionStorage.getItem(KEY_TRIES) || 0);
+    /* ---------- 在签到页执行 ---------- */
+    async function signOnPage(force = false) {
+        const state = await serverState();
+        if (!state.loggedIn) { log('未登录，跳过'); return false; }
+        if (state.signed) {
+            markDone();
+            if (!force) { log('今日已签到'); return true; }
+            return true;
+        }
 
+        const form = findForm();
+        if (!form) {
+            // 页面还没渲染完（SPA）就再等一会儿
+            const late = await waitFor(findForm, 6000, 300);
+            if (!late) { warn('找不到签到表单 .signin-form，页面结构可能已变化'); return false; }
+            return await signWithForm(late);
+        }
+        return await signWithForm(form);
+    }
+
+    async function signWithForm(form) {
+        const capHost = form.querySelector('[data-signin-cap]') || form;
+        const tokenInput = () => form.querySelector('input[name="cap-token"]');
+
+        await sleep(300);
+
+        // 站点行为：拦截无 cap-token 的 submit → 展开面板 → focus widget
+        const btn = form.querySelector('button[type="submit"], input[type="submit"], button');
+        if (btn && !btn.disabled) {
+            btn.click();
+            log('点击签到按钮');
+        } else if (typeof form.requestSubmit === 'function') {
+            form.requestSubmit();
+            log('触发 requestSubmit');
+        } else {
+            form.submit();
+            log('触发 submit');
+        }
+
+        const widget = await waitFor(() => capHost.querySelector('cap-widget'), 8000, 200);
+        if (widget) {
+            log('cap-widget 已出现，等待解出 token');
+            await nudge(widget);
+        } else {
+            warn('未出现 cap-widget');
+        }
+
+        // 站点自己会在 solve 后写 token 并重新提交
+        await waitFor(() => {
+            const i = tokenInput();
+            return i && i.value;
+        }, 45000, 300);
+
+        const ok = await verifySigned();
+        if (ok) {
+            markDone();
+            toast('自动签到成功', 'success');
+            log('签到成功');
+        } else {
+            toast('自动签到未确认，请手动点击一次', 'error');
+            warn('签到未确认');
+        }
+        return ok;
+    }
+
+    /* ---------- 主流程 ---------- */
+    const isSigninPath = () => /^\/(checkin|signin)\/?$/.test(location.pathname);
+
+    async function run(auto = false) {
+        if (busy) return;
+        busy = true;
         try {
-            if (onSigninPage || forceFlag) {
-                sessionStorage.removeItem(KEY_FORCE);
-                const r = await pageSignin();
-                if (r.ok) {
-                    GM_setValue(KEY_LAST, today());
-                    sessionStorage.removeItem(KEY_TRIES);
-                    return; // 页面会跳转，由下次加载确认
-                }
-                warn('页面签到失败', r.reason);
-                // 已经在签到页仍失败 -> 不再跳转，避免死循环
-                if (onSigninPage) { toast('自动签到失败，请手动点击验证', 'error'); return; }
-            }
-
-            const r = await silentSignin();
-            if (r.ok) {
-                GM_setValue(KEY_LAST, today());
-                sessionStorage.removeItem(KEY_TRIES);
-                if (!r.already) toast('自动签到成功', 'success');
-                log('签到完成');
+            if (auto && store.get(KEY_LAST, '') === todayKey()) {
+                log('今日已处理，跳过');
                 return;
             }
 
-            log('静默签到未成功，尝试跳转签到页');
-            if (tries >= 2) { toast('自动签到失败，请手动签到', 'error'); return; }
-            sessionStorage.setItem(KEY_TRIES, String(tries + 1));
-            sessionStorage.setItem(KEY_FORCE, '1');
-            location.assign(SIGNIN_URL);
+            const state = await serverState();
+            if (!state.loggedIn) { log('未登录，跳过'); return; }
+            if (state.signed) { markDone(); log('今日已签到'); return; }
+
+            if (isSigninPath()) {
+                await signOnPage(!auto);
+                return;
+            }
+
+            // 其它页面：只在当天第一次自动跳转到签到页
+            if (session.get(KEY_NAV) === '1') { log('本次已跳转过，停止'); return; }
+            session.set(KEY_NAV, '1');
+            log('今日未签到，跳转', CHECKIN_URL);
+            location.assign(CHECKIN_URL);
         } catch (e) {
-            warn('签到异常', e);
+            warn('主流程异常', e);
+        } finally {
+            busy = false;
         }
     }
 
-    /* ============ 菜单命令 ============ */
+    /* SPA 客户端路由：切到签到页时再跑一次 */
+    function watchRoute() {
+        if (watched) return;
+        watched = true;
+        let last = location.pathname;
+        setInterval(() => {
+            if (location.pathname === last) return;
+            last = location.pathname;
+            if (isSigninPath()) setTimeout(() => run(false), 800);
+        }, 1000);
+    }
+
+    /* ---------- 菜单 ---------- */
     if (typeof GM_registerMenuCommand === 'function') {
         GM_registerMenuCommand('立即签到（强制）', () => {
-            GM_setValue(KEY_LAST, '');
-            run(true);
+            store.set(KEY_LAST, '');
+            session.del(KEY_NAV);
+            run(false);
         });
         GM_registerMenuCommand('重置今日签到状态', () => {
-            GM_setValue(KEY_LAST, '');
+            store.set(KEY_LAST, '');
+            session.del(KEY_NAV);
             toast('已重置，下次载入将重新签到');
         });
     }
 
-    /* ============ 启动 ============ */
-    // 页面加载完成后延迟一点，等论坛自身脚本就绪
-    const kick = () => setTimeout(() => run(false), 1500);
+    /* ---------- 启动 ---------- */
+    const kick = () => {
+        setTimeout(() => run(true), 1200);
+        watchRoute();
+    };
     if (document.readyState === 'complete') kick();
     else window.addEventListener('load', kick, { once: true });
 })();
