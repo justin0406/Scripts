@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         烧饼论坛 自动签到 (CAP 版)
 // @namespace    https://sb.sb/
-// @version      2.0.0
+// @version      2.1.0
 // @description  在 Safari 打开烧饼论坛时自动完成 /checkin/ 每日签到（cap 工作量证明由站点自身组件完成）。
 // @match        *://sb.sb/*
 // @updateURL    https://raw.githubusercontent.com/justin0406/Scripts/main/sb-auto-signin.user.js
@@ -30,6 +30,7 @@
 
     const LOG = '[SB-CAP]';
     const CHECKIN_URL = '/checkin/';
+    const HOME_URL = '/';
     const KEY_LAST = 'sbCapLastSignin';
     const KEY_NAV = 'sbCapAutoNav';
     const VERIFY_TRIES = 14;
@@ -179,6 +180,15 @@
         session.del(KEY_NAV);
     }
 
+    /* 签到完成后回到论坛首页；延迟一点让 toast 能被看到 */
+    function goHome(delay = 1200) {
+        if (location.pathname === HOME_URL) return;
+        log('签到完成，返回首页');
+        setTimeout(() => {
+            try { location.assign(HOME_URL); } catch (e) { location.href = HOME_URL; }
+        }, delay);
+    }
+
     /* ---------- 在签到页执行 ---------- */
     async function signOnPage(force = false) {
         const state = await serverState();
@@ -237,6 +247,7 @@
             markDone();
             toast('自动签到成功', 'success');
             log('签到成功');
+            goHome();
         } else {
             toast('自动签到未确认，请手动点击一次', 'error');
             warn('签到未确认');

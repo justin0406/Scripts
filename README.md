@@ -4,7 +4,7 @@
 
 | 文件 | 说明 | 安装 |
 |---|---|---|
-| `sb-auto-signin.user.js` | 烧饼论坛 (sb.sb) 自动签到。打开论坛自动判断状态，未签到则跳到 `/checkin/`，触发站点自身的签到表单与 cap 组件完成验证并回查确认 | [安装](https://raw.githubusercontent.com/justin0406/Scripts/main/sb-auto-signin.user.js) |
+| `sb-auto-signin.user.js` | 烧饼论坛 (sb.sb) 自动签到。打开论坛自动判断状态，未签到则跳到 `/checkin/`，触发站点自身的签到表单与 cap 组件完成验证、回查确认，成功后回到论坛首页 | [安装](https://raw.githubusercontent.com/justin0406/Scripts/main/sb-auto-signin.user.js) |
 | `cloud139.js` | 中国移动云盘（139 云盘）自动任务，已修复 JWT 登录端点 | 由订阅引用 |
 
 > `cloud139.js` 自 `justin0406/Rules` 迁移而来。
