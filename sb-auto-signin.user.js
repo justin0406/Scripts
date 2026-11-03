@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         烧饼论坛 自动签到 (CAP 版)
 // @namespace    https://sb.sb/
-// @version      2.1.0
+// @version      2.2.0
 // @description  在 Safari 打开烧饼论坛时自动完成 /checkin/ 每日签到（cap 工作量证明由站点自身组件完成）。
 // @match        *://sb.sb/*
 // @updateURL    https://raw.githubusercontent.com/justin0406/Scripts/main/sb-auto-signin.user.js
@@ -129,6 +129,22 @@
         };
     }
 
+    /* fetch 在部分注入环境里会失败，所以判断一律先用当前 DOM，网络只做兜底 */
+    function pageSigned() {
+        try { return /今日已签到/.test(document.body.innerText || ''); } catch (e) { return false; }
+    }
+
+    function pageGuest() {
+        try {
+            const html = document.documentElement.innerHTML;
+            return !/\/logout\//.test(html) && /href="\/login\//.test(html);
+        } catch (e) { return false; }
+    }
+
+    async function safeState() {
+        try { return await serverState(); } catch (e) { return null; }
+    }
+
     function findForm() {
         const direct = document.querySelector('form.signin-form');
         if (direct) return direct;
@@ -167,10 +183,9 @@
     async function verifySigned() {
         for (let i = 0; i < VERIFY_TRIES; i += 1) {
             await sleep(VERIFY_GAP);
-            try {
-                const st = await serverState();
-                if (st.signed) return true;
-            } catch (e) { warn('回查失败', e); }
+            if (pageSigned()) return true;
+            const st = await safeState();
+            if (st && st.signed) return true;
         }
         return false;
     }
@@ -190,21 +205,16 @@
     }
 
     /* ---------- 在签到页执行 ---------- */
-    async function signOnPage(force = false) {
-        const state = await serverState();
-        if (!state.loggedIn) { log('未登录，跳过'); return false; }
-        if (state.signed) {
-            markDone();
-            if (!force) { log('今日已签到'); return true; }
-            return true;
-        }
+    async function signOnPage() {
+        if (pageSigned()) { markDone(); log('今日已签到'); goHome(); return true; }
+        if (pageGuest()) { log('未登录，跳过'); return false; }
 
-        const form = findForm();
+        const form = findForm() || (await waitFor(findForm, 6000, 300));
         if (!form) {
-            // 页面还没渲染完（SPA）就再等一会儿
-            const late = await waitFor(findForm, 6000, 300);
-            if (!late) { warn('找不到签到表单 .signin-form，页面结构可能已变化'); return false; }
-            return await signWithForm(late);
+            const st = await safeState();
+            if (st && st.signed) { markDone(); log('今日已签到'); goHome(); return true; }
+            warn('未找到签到入口（可能未登录或页面结构已变化）');
+            return false;
         }
         return await signWithForm(form);
     }
@@ -267,19 +277,15 @@
                 return;
             }
 
-            const state = await serverState();
-            if (!state.loggedIn) { log('未登录，跳过'); return; }
-            if (state.signed) { markDone(); log('今日已签到'); return; }
-
             if (isSigninPath()) {
-                await signOnPage(!auto);
+                await signOnPage();
                 return;
             }
 
-            // 其它页面：只在当天第一次自动跳转到签到页
+            // 其它页面：直接去签到页，不再先做网络探测（fetch 被拦时会静默失败）
             if (session.get(KEY_NAV) === '1') { log('本次已跳转过，停止'); return; }
             session.set(KEY_NAV, '1');
-            log('今日未签到，跳转', CHECKIN_URL);
+            log('进入签到页', CHECKIN_URL);
             location.assign(CHECKIN_URL);
         } catch (e) {
             warn('主流程异常', e);
@@ -316,6 +322,7 @@
 
     /* ---------- 启动 ---------- */
     const kick = () => {
+        log('v2.2.0 loaded', location.href, 'signedToday=', pageSigned());
         setTimeout(() => run(true), 1200);
         watchRoute();
     };
