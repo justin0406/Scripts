@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         烧饼论坛 自动签到 (CAP 版)
 // @namespace    https://sb.sb/
-// @version      2.2.0
+// @version      2.2.1
 // @description  在 Safari 打开烧饼论坛时自动完成 /checkin/ 每日签到（cap 工作量证明由站点自身组件完成）。
 // @match        *://sb.sb/*
 // @updateURL    https://raw.githubusercontent.com/justin0406/Scripts/main/sb-auto-signin.user.js
@@ -192,7 +192,6 @@
 
     function markDone() {
         store.set(KEY_LAST, todayKey());
-        session.del(KEY_NAV);
     }
 
     /* 签到完成后回到论坛首页；延迟一点让 toast 能被看到 */
@@ -268,11 +267,11 @@
     /* ---------- 主流程 ---------- */
     const isSigninPath = () => /^\/(checkin|signin)\/?$/.test(location.pathname);
 
-    async function run(auto = false) {
+    async function run(auto = false, force = false) {
         if (busy) return;
         busy = true;
         try {
-            if (auto && store.get(KEY_LAST, '') === todayKey()) {
+            if (!force && auto && store.get(KEY_LAST, '') === todayKey()) {
                 log('今日已处理，跳过');
                 return;
             }
@@ -282,9 +281,19 @@
                 return;
             }
 
-            // 其它页面：直接去签到页，不再先做网络探测（fetch 被拦时会静默失败）
-            if (session.get(KEY_NAV) === '1') { log('本次已跳转过，停止'); return; }
-            session.set(KEY_NAV, '1');
+            if (force) {
+                log('手动触发，进入签到页', CHECKIN_URL);
+                location.assign(CHECKIN_URL);
+                return;
+            }
+
+            // 刚签到完被送回首页时不要再跳，避免来回弹
+            if (document.referrer && document.referrer.includes('/checkin')) {
+                log('刚从签到页返回，停止');
+                return;
+            }
+
+            // 其它页面：直接去签到页，不做网络探测（fetch 被拦时会静默失败）
             log('进入签到页', CHECKIN_URL);
             location.assign(CHECKIN_URL);
         } catch (e) {
@@ -310,19 +319,17 @@
     if (typeof GM_registerMenuCommand === 'function') {
         GM_registerMenuCommand('立即签到（强制）', () => {
             store.set(KEY_LAST, '');
-            session.del(KEY_NAV);
-            run(false);
+            run(false, true);
         });
         GM_registerMenuCommand('重置今日签到状态', () => {
             store.set(KEY_LAST, '');
-            session.del(KEY_NAV);
             toast('已重置，下次载入将重新签到');
         });
     }
 
     /* ---------- 启动 ---------- */
     const kick = () => {
-        log('v2.2.0 loaded', location.href, 'signedToday=', pageSigned());
+        log('v2.2.1 loaded', location.href, 'signedToday=', pageSigned());
         setTimeout(() => run(true), 1200);
         watchRoute();
     };
